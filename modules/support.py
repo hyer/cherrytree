@@ -26,6 +26,9 @@ import os
 import webbrowser
 import re
 import time
+
+from rendermath import render_math
+
 import cons
 import config
 import exports
@@ -62,7 +65,7 @@ def auto_decode_str(in_str, from_clipboard=False):
     elif in_str.startswith(("\xFF\xFE", "\xFE\xFF")): # UTF-16 BOMs
         encodings += [cons.STR_UTF16]
     elif from_clipboard:
-        if "html" in in_str or "HTML" in in_str:
+        if re.search(r"</[a-zA-Z]+>", in_str) is not None:
             encodings = [cons.STR_UTF8] + encodings
         else:
             encodings = [cons.STR_UTF16, cons.STR_UTF8] + encodings
@@ -271,9 +274,9 @@ def on_sourceview_event_after_scroll(dad, text_view, event):
     """Called after every gtk.gdk.SCROLL on the SourceView"""
     if dad.ctrl_down:
         if event.direction == gtk.gdk.SCROLL_UP:
-            dad.zoom_text_p()
+            dad.zoom_text(True)
         elif event.direction == gtk.gdk.SCROLL_DOWN:
-            dad.zoom_text_m()
+            dad.zoom_text(False)
     return False
 
 def on_sourceview_event_after_key_release(dad, text_view, event):
@@ -503,13 +506,14 @@ def sourceview_cursor_and_tooltips_handler(dad, text_view, x, y):
         text_view.get_window(gtk.TEXT_WINDOW_TEXT).set_cursor(gtk.gdk.Cursor(gtk.gdk.XTERM))
         text_view.set_tooltip_text(None)
 
-def rich_text_node_modify_codeboxes_font(start_iter, code_font):
+def rich_text_node_modify_codeboxes_font(start_iter, dad):
     """Modify Font to CodeBoxes"""
     curr_iter = start_iter.copy()
     while 1:
         anchor = curr_iter.get_child_anchor()
         if anchor and "sourcebuffer" in dir(anchor):
-            anchor.sourceview.modify_font(pango.FontDescription(code_font))
+            target_font = dad.code_font if anchor.syntax_highlighting != cons.PLAIN_TEXT_ID else dad.pt_font
+            anchor.sourceview.modify_font(pango.FontDescription(target_font))
         if not curr_iter.forward_char(): break
 
 def rich_text_node_modify_codeboxes_color(start_iter, dad):
@@ -557,17 +561,20 @@ def clean_from_chars_not_for_filename(filename_in):
     filename_out = filename_out.replace(cons.CHAR_NEWLINE, "").replace(cons.CHAR_CR, "").strip()
     return filename_out.replace(cons.CHAR_SPACE, cons.CHAR_USCORE)
 
-def get_node_hierarchical_name(dad, tree_iter, separator="--", for_filename=True, root_to_leaf=True):
+def get_node_hierarchical_name(dad, tree_iter, separator="--", for_filename=True, root_to_leaf=True, trailer=""):
     """Get the Node Hierarchical Name"""
-    hierarchical_name = dad.treestore[tree_iter][1].strip()
+    hierarchical_name = exports.clean_text_to_utf8(dad.treestore[tree_iter][1]).strip()
     father_iter = dad.treestore.iter_parent(tree_iter)
     while father_iter:
-        if root_to_leaf:
-            hierarchical_name = dad.treestore[father_iter][1].strip() + separator + hierarchical_name
+        father_name = exports.clean_text_to_utf8(dad.treestore[father_iter][1]).strip()
+        if root_to_leaf is True:
+            hierarchical_name = father_name + separator + hierarchical_name
         else:
-            hierarchical_name = hierarchical_name + separator + dad.treestore[father_iter][1].strip()
+            hierarchical_name = hierarchical_name + separator + father_name
         father_iter = dad.treestore.iter_parent(father_iter)
-    if for_filename:
+    if trailer:
+        hierarchical_name += trailer
+    if for_filename is True:
         hierarchical_name = clean_from_chars_not_for_filename(hierarchical_name)
         if len(hierarchical_name) > cons.MAX_FILE_NAME_LEN:
             hierarchical_name = hierarchical_name[-cons.MAX_FILE_NAME_LEN:]
@@ -861,6 +868,7 @@ MA 02110-1301, USA.
 _("Chinese Simplified")+" (zh_CN) Channing Wong <channing.wong@qq.com>"+cons.CHAR_NEWLINE+
 _("Czech")+" (cs) Pavel Fric <fripohled@blogspot.com>"+cons.CHAR_NEWLINE+
 _("Dutch")+" (nl) Luuk Geurts, Patrick Vijgeboom <pj.vijgeboom@gmail.com>"+cons.CHAR_NEWLINE+
+_("Finnish")+" (fi) Henri Kaustinen <hendrix.ks81@gmail.com>"+cons.CHAR_NEWLINE+
 _("French")+" (fr) Klaus Becker <colonius@free.fr>"+cons.CHAR_NEWLINE+
 _("German")+" (de) Frank Brungräber <calexu@arcor.de>"+cons.CHAR_NEWLINE+
 _("Greek")+" (el) Delphina <delphina.2009@yahoo.gr>"+cons.CHAR_NEWLINE+
@@ -1002,37 +1010,66 @@ def dialog_image_handle(father_win, title, original_pixbuf):
         buttons=(gtk.STOCK_CANCEL, gtk.RESPONSE_REJECT,
                  gtk.STOCK_OK, gtk.RESPONSE_ACCEPT) )
     dialog.set_position(gtk.WIN_POS_CENTER_ON_PARENT)
-    dialog.set_default_size(600, 500)
+    dialog.set_default_size(600, 400)
+
     button_rotate_90_ccw = gtk.Button()
     button_rotate_90_ccw.set_image(gtk.image_new_from_stock("object-rotate-left", gtk.ICON_SIZE_DND))
+
     button_rotate_90_cw = gtk.Button()
     button_rotate_90_cw.set_image(gtk.image_new_from_stock("object-rotate-right", gtk.ICON_SIZE_DND))
+
     scrolledwindow = gtk.ScrolledWindow()
     scrolledwindow.set_policy(gtk.POLICY_AUTOMATIC, gtk.POLICY_AUTOMATIC)
     viewport = gtk.Viewport()
     image = gtk.image_new_from_pixbuf(original_pixbuf)
     scrolledwindow.add(viewport)
     viewport.add(image)
+
     hbox_1 = gtk.HBox()
     hbox_1.pack_start(button_rotate_90_ccw, expand=False)
     hbox_1.pack_start(scrolledwindow)
     hbox_1.pack_start(button_rotate_90_cw, expand=False)
     hbox_1.set_spacing(2)
-    label_width = gtk.Label(_("Width"))
+
+    label_width = gtk.Label(_("Width:"))
     adj_width = gtk.Adjustment(value=img_parms.width, lower=1, upper=10000, step_incr=1)
     spinbutton_width = gtk.SpinButton(adj_width)
-    label_height = gtk.Label(_("Height"))
+    label_height = gtk.Label(_("    Height:"))
     adj_height = gtk.Adjustment(value=img_parms.height, lower=1, upper=10000, step_incr=1)
     spinbutton_height = gtk.SpinButton(adj_height)
+
     hbox_2 = gtk.HBox()
-    hbox_2.pack_start(label_width)
+    hbox_2.pack_start(label_width, expand=False)
     hbox_2.pack_start(spinbutton_width)
-    hbox_2.pack_start(label_height)
+    hbox_2.pack_start(label_height, expand=False)
     hbox_2.pack_start(spinbutton_height)
+    hbox_2.set_spacing(2)
+
+    # latex process
+    latex_dpi = gtk.Label(_("Latex dpi: "))
+    latex_dpi_entry = gtk.Entry()
+    latex_dpi_entry.set_max_length(10)
+    latex_dpi_entry.set_text("200")
+
+    latex = gtk.Label(_("Latex Expression: "))
+    latex_entry = gtk.Entry()
+    latex_entry.set_max_length(200)
+    latex_entry.set_text("")
+    button_latex_render = gtk.Button('render')
+
+    hbox_3 = gtk.HBox()
+    hbox_3.pack_start(latex_dpi, expand=False)
+    hbox_3.pack_start(latex_dpi_entry, expand=False)
+    hbox_3.pack_start(latex, expand=False)
+    hbox_3.pack_start(latex_entry)
+    hbox_3.pack_start(button_latex_render, expand=False)
+
     content_area = dialog.get_content_area()
     content_area.pack_start(hbox_1)
     content_area.pack_start(hbox_2, expand=False)
+    content_area.pack_start(hbox_3, expand=False)
     content_area.set_spacing(6)
+
     def image_load_into_dialog():
         spinbutton_width.set_value(img_parms.width)
         spinbutton_height.set_value(img_parms.height)
@@ -1080,11 +1117,27 @@ def dialog_image_handle(father_win, title, original_pixbuf):
             except: print cons.STR_PYGTK_222_REQUIRED
             return True
         return False
+
+    def on_button_latex_render(*args):
+        latex_exp = latex_entry.get_text()
+        formule_img_file = '/tmp/cherrytree_latex_tmp.png'
+        latex_dpi_entry_val = latex_dpi_entry.get_text()
+        render_math(latex_exp, formule_img_file, dpi=int(latex_dpi_entry_val))
+        img_parms.original_pixbuf = gtk.gdk.pixbuf_new_from_file(formule_img_file)
+        img_parms.height = img_parms.original_pixbuf.pixel_array.shape[0]
+        img_parms.width = img_parms.original_pixbuf.pixel_array.shape[1]
+        img_parms.image_w_h_ration = float(img_parms.width)/img_parms.height
+        os.remove(formule_img_file)
+        image_load_into_dialog()
+
     button_rotate_90_ccw.connect('clicked', on_button_rotate_90_ccw_clicked)
     button_rotate_90_cw.connect('clicked', on_button_rotate_90_cw_clicked)
     spinbutton_width.connect('value-changed', on_spinbutton_image_width_value_changed)
     spinbutton_height.connect('value-changed', on_spinbutton_image_height_value_changed)
+
+    button_latex_render.connect('clicked', on_button_latex_render)
     dialog.connect('key_press_event', on_key_press_imagehandledialog)
+
     image_load_into_dialog()
     content_area.show_all()
     try: dialog.get_widget_for_response(gtk.RESPONSE_ACCEPT).grab_focus()
@@ -1829,7 +1882,7 @@ def add_recent_document(dad, filepath):
 
 def insert_special_char(menu_item, special_char, dad):
     """A Special character insert was Requested"""
-    text_view, text_buffer, from_codebox = dad.get_text_view_n_buffer_codebox_proof()
+    text_view, text_buffer, syntax_highl, from_codebox = dad.get_text_view_n_buffer_codebox_proof()
     if not text_buffer: return
     if not dad.is_curr_node_not_read_only_or_error(): return
     text_buffer.insert_at_cursor(special_char)
